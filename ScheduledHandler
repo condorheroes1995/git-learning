@@ -1,0 +1,39 @@
+package com.chinaoly.znpz.handler;
+
+import com.chinaoly.znpz.service.ITaskService;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+import java.util.concurrent.TimeUnit;
+
+/**
+ * 定时任务处理
+ * @author zhaohg
+ * @date 2019/04/18.
+ */
+@Component
+@Slf4j
+public class ScheduledHandler {
+    
+    @Autowired
+    private RedisTemplate<String, String> redisTemplate;
+    
+    @Autowired
+    private ITaskService taskService;
+    
+    @Scheduled(fixedRate = 10000)  //定时器2s一次  //每天03:05执行 @Scheduled(cron = "0 05 03 ? * *")
+    public void shTask() {
+        //先判断redis中是否有锁记录,如果能设值成功,代表拿到锁，不能设值成功就是锁还没释放
+        if (redisTemplate.opsForValue().setIfAbsent("pz_task", "value")) {
+            //设值成功后,设置锁超时时间 (我这里是30分钟)
+            redisTemplate.expire("pz_task", 10, TimeUnit.MINUTES);
+            //业务
+            taskService.handlerTaskData();
+            log.debug("定时任务......");
+        }
+    }
+    
+}
