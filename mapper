@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.chinaoly.frm.znbk.dao.mapper.EndYjjgMapper">
+	<resultMap id="BaseResultMap" type="com.chinaoly.frm.znbk.Model.EndYjjg">
+		<result column="keyid" jdbcType="VARCHAR" property="keyid" />
+		<result column="idCard" jdbcType="VARCHAR" property="idCard" />
+		<result column="xm" jdbcType="VARCHAR" property="xm" />
+		<result column="xb" jdbcType="VARCHAR" property="xb" />
+		<result column="mz" jdbcType="VARCHAR" property="mz" />
+		<result column="hjd" jdbcType="VARCHAR" property="hjd" />
+		<result column="hdlbdm" jdbcType="VARCHAR" property="hdlbdm" />
+		<result column="hdlbmc" jdbcType="VARCHAR" property="hdlbmc" />
+		<result column="hdfsdqhdm_in" jdbcType="VARCHAR" property="hdfsdqhdmIn" />
+		<result column="hdfsdqhmc_in" jdbcType="VARCHAR" property="hdfsdqhmcIn" />
+		<result column="hdfsdqhdm_out" jdbcType="VARCHAR" property="hdfsdqhdmOut" />
+		<result column="hdfsdqhmc_out" jdbcType="VARCHAR" property="hdfsdqhmcOut" />
+		<result column="hdfsddm_in" jdbcType="VARCHAR" property="hdfsddmIn" />
+		<result column="hdfsddm_out" jdbcType="VARCHAR" property="hdfsddmOut" />
+		<result column="hdfsdmc_in" jdbcType="VARCHAR" property="hdfsdmcIn" />
+		<result column="hdfsdmc_out" jdbcType="VARCHAR" property="hdfsdmcOut" />
+		<result column="hdfsdxz_in" jdbcType="VARCHAR" property="hdfsdxzIn" />
+		<result column="hdfsdxz_out" jdbcType="VARCHAR" property="hdfsdxzOut" />
+		<result column="hdbzxx" jdbcType="VARCHAR" property="hdbzxx" />
+		<result column="jwd_in" jdbcType="VARCHAR" property="jwdIn" />
+		<result column="jwd_out" jdbcType="VARCHAR" property="jwdOut" />
+		<result column="hdfssj" jdbcType="VARCHAR" property="hdfssj" />
+		<result column="hdjssj" jdbcType="VARCHAR" property="hdjssj" />
+		<result column="time_stamp" jdbcType="BIGINT" property="timeStamp" />
+		<result column="mxids" jdbcType="VARCHAR" property="mxids" />
+		<result column="updtime" jdbcType="TIMESTAMP" property="updtime" />
+		<result column="jwd" jdbcType="VARCHAR" property="jwd" />
+	</resultMap>
+
+	<select id="findResultPageCount" resultType="Long">
+		select count(*) from end_yjjg where mxids like #{mxids}
+		<if test="xm != null">
+			and xm like #{xm}
+		</if>
+		<if test="idCard != null">
+			and idCard like #{idCard}
+		</if>
+		<if test="hdfsdqhmcIn != null">
+			and hdfsdqhmcIn = #{hdfsdqhmcIn}
+		</if>
+		<if test="hdlbdm != null">
+			and hdlbdm = #{hdlbdm}
+		</if>
+		<if test="startTime != null">
+		  <![CDATA[and hdfssj > ]]>#{startTime}
+		</if>
+		<if test="endTime != null">
+		  <![CDATA[and hdfssj <= ]]>#{endTime}
+		</if>
+	</select>
+
+	<select id="findResultPage" resultMap="BaseResultMap">
+		select * from end_yjjg where mxids like #{mxids}
+		<if test="xm != null">
+			and xm like #{xm}
+		</if>
+		<if test="idCard != null">
+			and idCard like #{idCard}
+		</if>
+		<if test="hdfsdqhmcIn != null">
+			and hdfsdqhmcIn = #{hdfsdqhmcIn}
+		</if>
+		<if test="hdlbdm != null">
+			and hdlbdm = #{hdlbdm}
+		</if>
+		<if test="startTime != null">
+		  <![CDATA[and hdfssj > ]]>#{startTime}
+		</if>
+		<if test="endTime != null">
+		  <![CDATA[and hdfssj <= ]]>#{endTime}
+		</if>
+		order by hdfssj desc
+		<if test="pageSize != null and startRow">
+			limit #{startRow},#{pageSize}
+		</if>
+	</select>
+</mapper>
