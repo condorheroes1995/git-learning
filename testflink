@@ -1,0 +1,1231 @@
+package com.h3c.itoa
+
+/**
+  * Created by j17027 on 2019/1/21.
+  */
+
+import java.io.{File, FileNotFoundException}
+import java.sql.Timestamp
+import java.text.SimpleDateFormat
+import java.util
+import java.util.{Date, Properties}
+
+import com.h3c.bigdata.itoa.adp.log.{LogUtil, Severity}
+import com.h3c.common.bean.{AdmIfStatus, BroadcastConfig}
+import com.h3c.common.sources.PGConfigSource
+import com.h3c.common.{JsonUtil, PropertiesUtils, StringUtils, _}
+import com.h3c.ndp._
+import net.sf.json.JSONObject
+import org.apache.commons.lang3.exception.ExceptionUtils
+import org.apache.flink.api.common.functions.ReduceFunction
+import org.apache.flink.api.common.restartstrategy.RestartStrategies
+import org.apache.flink.api.common.serialization.SimpleStringSchema
+import org.apache.flink.api.common.state.MapStateDescriptor
+import org.apache.flink.api.common.typeinfo.{BasicTypeInfo, TypeHint, TypeInformation}
+import org.apache.flink.api.java.utils.ParameterTool
+import org.apache.flink.streaming.api.TimeCharacteristic
+import org.apache.flink.streaming.api.datastream.BroadcastStream
+import org.apache.flink.streaming.api.functions.AssignerWithPeriodicWatermarks
+import org.apache.flink.streaming.api.functions.co.BroadcastProcessFunction
+import org.apache.flink.streaming.api.scala._
+import org.apache.flink.streaming.api.watermark.Watermark
+import org.apache.flink.streaming.api.windowing.time.Time
+import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer010
+import org.apache.flink.util.Collector
+
+import scala.collection.JavaConversions._
+import scala.collection.mutable
+import scala.util.parsing.json
+
+
+/**
+  * Created by y19625 on 2018/12/24.
+  */
+class FlinkSnmpTest private(appName: String) extends FlinkParquetBase {
+
+
+  /**
+    * 处理输入参数
+    *
+    * @param args
+    * @param conf
+    */
+  override def dealWithArgs(args: Array[String], conf: mutable.Map[String, String]): Unit = {
+    if (null != args && args.length == 1 && null != conf) {
+      val configFile = new File(args(0))
+      if (!configFile.exists()) {
+        throw new FileNotFoundException()
+      }
+      val prop = PropertiesUtils.loadConf(configFile.getAbsolutePath())
+      val keys = prop.keySet()
+      val it = keys.iterator()
+      while (it.hasNext) {
+        val key = it.next()
+        conf(key.toString) = prop.getProperty(key.toString)
+      }
+    }
+  }
+
+  def run(args: Array[String]): Unit = {
+    //    读取配置文件去
+    val itoaBaseConf = loadConf(args)
+    if (itoaBaseConf == None) {
+      LogUtil.diagLog(Severity.WARN, "config file error! please check again!")
+      sys.exit(1)
+    }
+
+    //logInfo("Input args: " + util.Arrays.asList(args))
+    LogUtil.diagLog(Severity.INFO, "Input args: " + util.Arrays.asList(args))
+
+    // parse input arguments
+    val params = ParameterTool.fromMap(itoaBaseConf)
+
+
+    // env配置
+    val env = StreamExecutionEnvironment.getExecutionEnvironment
+    env.enableCheckpointing(1 * 60 * 60 * 1000L) //1 hour
+    env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime) // 事件时间
+    env.setParallelism(1) // 并行度
+
+    //执行配置
+    val executionConfig = env.getConfig
+    executionConfig.disableSysoutLogging()
+    executionConfig.setGlobalJobParameters(params) // make parameters available in the web interface
+    executionConfig.setRestartStrategy(RestartStrategies.fixedDelayRestart(5, 10 * 1000L))
+
+    //kafka数据源配置
+    val groupIdKey = "group.id"
+    val bootstrapServersKey = "bootstrap.servers"
+    //val zookeeperConnectKey = "zookeeper.connect" //kafka 0.8.x版本才需要
+    val topicList = params.get("kafka.topics").split(",").toList
+
+    //参数
+    /*val ifHighSpeedPath =  itoaBaseConf("if.high.speed.path").toString*/
+
+    val merge1MinSecond = itoaBaseConf("flink.streaming.merge.1min.seconds").toInt
+
+    //influxdb数据库参数
+    var influxdbUserName: String = itoaBaseConf("influxdb.username").toString
+    var influxdbPassWord: String = itoaBaseConf("influxdb.passwd").toString
+    var influxdbOpenUrl: String = itoaBaseConf("influxdb.openurl").toString
+
+
+    var influxdbSNMPDataBase = itoaBaseConf("influxdb.snmp.database").toString
+    var influxdbFanRetentionPolicy = itoaBaseConf("influxdb.fan.retentionpolicy").toString
+    var influxdbPowerRetentionPolicy = itoaBaseConf("influxdb.power.retentionpolicy").toString
+    var influxdbNodeRetentionPolicy = itoaBaseConf("influxdb.node.retentionpolicy").toString
+    var influxdbLinkRetentionPolicy = itoaBaseConf("influxdb.link.retentionpolicy").toString
+    var influxdbInterfaceRetentionPolicy = itoaBaseConf("influxdb.interface.retentionpolicy").toString
+    var influxdbIpRetentionPolicy = itoaBaseConf("influxdb.ip.retentionpolicy").toString
+    var influxdbNqaRetentionPolicy = itoaBaseConf("influxdb.nqa.retentionpolicy").toString
+    var influxdbHealthRetentionpolicy = itoaBaseConf("influxdb.health.retentionpolicy").toString
+    val influxdbPSEPolicy = itoaBaseConf("influxdb.pse.retentionpolicy").toString
+    val influxdbPoeIfPolicy = itoaBaseConf("influxdb.poe.if.retentionpolicy").toString
+
+    var watermarks1min = itoaBaseConf("watermarks.1min").toInt //窗口延时1min
+    var watermarksNodeStatistics = itoaBaseConf("watermarks.node.statistics").toInt //node统计窗口延时
+    var watermarkslinkStatus = itoaBaseConf("watermarks.link.Status").toInt //node统计窗口延时
+
+
+    val kafkaConsumerProps: Properties = new Properties()
+    kafkaConsumerProps.setProperty(groupIdKey, params.get(groupIdKey))
+    kafkaConsumerProps.setProperty(bootstrapServersKey, params.get(bootstrapServersKey))
+    //    kafkaConsumerProps.setProperty(zookeeperConnectKey, params.get(zookeeperConnectKey))
+
+    //snmp广播变量配置信息key
+    val topoLinkConfigKey = "SNMP-CONFIGKEY"
+
+    // 广播状态描述符
+    val configStateDescriptor = new MapStateDescriptor[String, BroadcastConfig]("configUserInfoBroadcastState",
+      BasicTypeInfo.STRING_TYPE_INFO, TypeInformation.of(new TypeHint[BroadcastConfig] {})
+    )
+
+    // 广播状态描述符AssetInfo
+    val configStateDescriptorAsset = new MapStateDescriptor[String, BroadcastConfig]("configAssetInfoBroadcastState",
+      BasicTypeInfo.STRING_TYPE_INFO, TypeInformation.of(new TypeHint[BroadcastConfig] {})
+    )
+
+    // 配置广播流
+    val configUserInfoStream: BroadcastStream[BroadcastConfig] = env.addSource(new PGConfigSource(params.get("db.url.ndp"), params.get("db.user.ndp"), params.get("db.password.ndp"), 60, "snmp", "")).broadcast(configStateDescriptor)
+
+    //配置广播流Asset
+    val configAssetInfoStream: BroadcastStream[BroadcastConfig] = env.addSource(new PGConfigSource(params.get("db.url"), params.get("db.user"), params.get("db.password"), 60, "snmp_df", "")).broadcast(configStateDescriptorAsset)
+
+
+    // 添加KafkaSource
+    val kafkaConsumer = new FlinkKafkaConsumer010[String](topicList, new SimpleStringSchema(), kafkaConsumerProps)
+    kafkaConsumer.setStartFromLatest()
+
+    val kafkaStream: DataStream[JSONObject] = env.addSource(kafkaConsumer)
+      .filter(str => {
+        StringUtils.isNotEmpty(str) && str.startsWith("{") && str.endsWith("}")
+      }).map(kv => {
+      // 解析json字符串
+      JsonUtil.parse(kv)
+    })
+
+    // 链路
+    val fdmIfRdd1 = kafkaStream.filter(kv => {
+      if (null != kv && null != kv.get("dataType")) {
+        "ifStatus".equals(kv.get("dataType").toString)
+      } else {
+        false
+      }
+    }).connect(configAssetInfoStream).process(
+      new BroadcastProcessFunction[JSONObject, BroadcastConfig, (Tuple2[String, Long], Tuple4[Long, Long, Long, Long], Tuple6[Double, Double, Double, Double, Double, Double], Tuple8[Double, Double, Double, Double, Double, Double, Double, Double], Tuple6[Long, Long, Long, Long, Long, Long])] {
+        override def processBroadcastElement(configValue: BroadcastConfig, context: BroadcastProcessFunction[JSONObject, BroadcastConfig, (Tuple2[String, Long], Tuple4[Long, Long, Long, Long], Tuple6[Double, Double, Double, Double, Double, Double], Tuple8[Double, Double, Double, Double, Double, Double, Double, Double], Tuple6[Long, Long, Long, Long, Long, Long])]#Context, collector: Collector[(Tuple2[String, Long], Tuple4[Long, Long, Long, Long], Tuple6[Double, Double, Double, Double, Double, Double], Tuple8[Double, Double, Double, Double, Double, Double, Double, Double], Tuple6[Long, Long, Long, Long, Long, Long])]): Unit = {
+          val configKey = configValue.getConfigKey
+          val state = context.getBroadcastState(configStateDescriptorAsset)
+          state.put(configKey, configValue)
+        }
+
+        override def processElement(value: JSONObject, readOnlyContext: BroadcastProcessFunction[JSONObject, BroadcastConfig, (Tuple2[String, Long], Tuple4[Long, Long, Long, Long], Tuple6[Double, Double, Double, Double, Double, Double], Tuple8[Double, Double, Double, Double, Double, Double, Double, Double], Tuple6[Long, Long, Long, Long, Long, Long])]#ReadOnlyContext, collector: Collector[(Tuple2[String, Long], Tuple4[Long, Long, Long, Long], Tuple6[Double, Double, Double, Double, Double, Double], Tuple8[Double, Double, Double, Double, Double, Double, Double, Double], Tuple6[Long, Long, Long, Long, Long, Long])]): Unit = {
+
+          var snmpConfig: BroadcastConfig = readOnlyContext.getBroadcastState(configStateDescriptorAsset).get(topoLinkConfigKey)
+
+          var asserInfoList: util.List[AssetInfo] = snmpConfig.getAsserInfoList
+          collector.collect(exchangeForIfStatus(value, asserInfoList))
+
+        }
+
+      }).filter(kv => {
+      val assetId: String = kv._1._1
+      if (null == assetId) false
+      else true
+    })
+    // todo 到这里为止只是做了根据ip找到资产ID，然后相同类别的字段 组成不同的元组，逻辑简单
+
+        val fdmIfRdd = fdmIfRdd1.connect(configUserInfoStream).process(
+          new BroadcastProcessFunction[((String, Long), (Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long, Long, Long, Long, Long)), BroadcastConfig, (((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double),
+            (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long))))] {
+
+            override def processBroadcastElement(configValue: BroadcastConfig, context: BroadcastProcessFunction[((String, Long), (Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long, Long, Long, Long, Long)), BroadcastConfig, (((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double),
+              (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long))))]#Context, collector: Collector[(((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double),
+              (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long))))]): Unit = {
+              val configKey = configValue.getConfigKey
+              val state = context.getBroadcastState(configStateDescriptor)
+              state.put(configKey, configValue)
+            }
+
+            override def processElement(value:((String, Long), (Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long, Long, Long, Long, Long)), readOnlyContext: BroadcastProcessFunction[((String, Long), (Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long, Long, Long, Long, Long)), BroadcastConfig, (((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double),
+              (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long))))]#ReadOnlyContext, collector: Collector[(((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double),
+              (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long))))]): Unit = {
+
+              var snmpConfig: BroadcastConfig = readOnlyContext.getBroadcastState(configStateDescriptor).get(topoLinkConfigKey)
+
+
+              var topoLink: TopoLink = null
+              var topoLinkMap: mutable.Map[String, TopoLink] = null
+
+              if (null != snmpConfig) {
+                topoLinkMap = snmpConfig.getConfigTopoLinkMap
+                var highSpeedConf: util.List[BandWidthSet] = snmpConfig.getHighSpeedConf
+                var key = value._1
+                var status = value._2
+                val highSpeed = if (highSpeedConf != null) {
+                  getLinkHighSpeed(topoLinkMap, highSpeedConf, key._1, key._2, status._4)
+                } else {
+                  status._4
+                }
+                //       (ifInOctets, ifInDiscards, ifInErrors, ifOutOctets, ifOutDiscards, ifOutErrors),
+                val octets = value._3
+                //      (ifHcInOctets, ifHcInUcastPkts, ifHcInMulticastPkts, ifHcInBroadcastPkts, ifHcOutOctets, ifHcOutUcastPkts, ifHcOutMulticastPkts, ifHcOutBroadcastPkts)
+                val hcOctets = value._4
+                // 计算 速率 利用率等      (inSpeed, outSpeed, inUseRatio, outUseRatio, inLoseRatio, outLoseRatio, inErrorRatio, outErrorRatio)                             添加last-Tuple14， fdm无需此字段，但gdm会用到                                                  添加oper、admin状态变化数(operStatusCnt, adminStatusCnt)
+                val value1 = ((status._1, status._2, status._3, highSpeed), value._3, value._4, value._5, (0L, 0L, 0F, 0F, 0F, 0F, 0F, 0F), (octets._1, octets._2, octets._3, octets._4, octets._5, octets._6, hcOctets._1, hcOctets._2, hcOctets._3, hcOctets._4, hcOctets._5, hcOctets._6, hcOctets._7, hcOctets._8), (0L, 0L))
+
+                collector.collect((key, value1))
+
+              }
+
+            }
+          }
+        )
+    // todo 以上部分代码其实就是在计算设备接口间的带宽，然后上一步的计算结果之上，加了些字段，但是都没有经过计算，只是简单的组装
+
+    val linkInfoDStream = fdmIfRdd.assignTimestampsAndWatermarks(new LinkTimestampExtractor(watermarks1min))
+
+    val fdmIfAggRdd = linkInfoDStream
+      .keyBy(_._1)
+      .timeWindow(Time.seconds(merge1MinSecond * 2), Time.seconds(merge1MinSecond))
+      .reduce(new ReduceFunction[((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double),
+        (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long)))] {
+        override def reduce(x: ((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double),
+          (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long))),
+                            y: ((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double),
+                              (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long)))):
+        ((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double),
+          (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long))) = {
+
+          /* 添加对时间相同的除 0异常判断  o15514 180226*/
+          //    logError("time: "+(x._1._1 - y._1._1).toString)
+
+
+          var inSpeed: Long = if (y._2._1._1 - x._2._1._1 != 0) ((y._2._3._1 - x._2._3._1) / ((y._2._1._1 - x._2._1._1) / 1000D)).toLong else -1L
+          var outSpeed: Long = if (y._2._1._1 - x._2._1._1 != 0) ((y._2._3._5 - x._2._3._5) / ((y._2._1._1 - x._2._1._1) / 1000D)).toLong else -1L
+
+          // 10000是 1000000 除以百分数 100得到
+          val highSpeed = max(x._2._1._4, y._2._1._4)
+          var inUseRatio: Float = if (highSpeed > 0) (inSpeed * 8) / (highSpeed * 10000F) else 0F
+          var outUseRatio: Float = if (highSpeed > 0) (outSpeed * 8) / (highSpeed * 10000F) else 0F
+          if (inUseRatio > 100) inUseRatio = 100
+          if (outUseRatio > 100) outUseRatio = 100
+          // (ifHcInUcastPkts, ifHcInMulticastPkts, ifHcInBroadcastPkts， indiscards，inerror)
+          val inPkts: Double = (y._2._3._2 + y._2._3._3 + y._2._3._4 + y._2._2._2 + y._2._2._3) - (x._2._3._2 + x._2._3._3 + x._2._3._4 + x._2._2._2 + x._2._2._3)
+          val outPkts: Double = (y._2._3._6 + y._2._3._7 + y._2._3._8 + y._2._2._5 + y._2._2._6) - (x._2._3._6 + x._2._3._7 + x._2._3._8 + x._2._2._5 + x._2._2._6)
+          val inLoseRatio: Float = if (0 != inPkts) Math.abs((y._2._2._2 - x._2._2._2) * 100F / inPkts).toFloat else 0F
+          val outLoseRatio: Float = if (0 != outPkts) Math.abs((y._2._2._5 - x._2._2._5) * 100F / outPkts).toFloat else 0F
+          val inErrorRatio: Float = if (0 != inPkts) Math.abs((y._2._2._3 - x._2._2._3) * 100F / inPkts).toFloat else 0F
+          val outErrorRatio: Float = if (0 != outPkts) Math.abs((y._2._2._6 - x._2._2._6) * 100F / outPkts).toFloat else 0F
+          val rate = (inSpeed, outSpeed, inUseRatio, outUseRatio, inLoseRatio, outLoseRatio, inErrorRatio, outErrorRatio)
+          val operStatusCnt = if (x._2._1._2 != y._2._1._2) 1L else 0L
+          val adminStatusCnt = if (x._2._1._3 != y._2._1._3) 1L else 0L
+
+          if (x._2._1._1 > y._2._1._1) {
+            ((x._1), (x._2._1, x._2._2, x._2._3, x._2._4, rate, y._2._6, (operStatusCnt, adminStatusCnt)))
+          }
+          else {
+            ((x._1), (y._2._1, y._2._2, y._2._3, y._2._4, rate, x._2._6, (operStatusCnt, adminStatusCnt)))
+          }
+        }
+      }).filter(kv => {
+      val rate = kv._2._5
+      // 除 0 过滤
+      if (rate._1 < 0 || rate._2 < 0) {
+        false
+      } else {
+        true
+      }
+    })
+
+
+    // 1min
+    val gdm1MinIfRdd = fdmIfAggRdd.map(kv => {
+      val power = kv._2._4
+      val peakPower = (power._2, power._3, power._5, power._6)
+      val rate = kv._2._5
+      val peakRate = (rate._1, rate._2, rate._3, rate._4, rate._5, rate._6, rate._7, rate._8, rate._1, rate._2, rate._3, rate._4, rate._5, rate._6, rate._7, rate._8)
+      val value = kv._2
+      (kv._1, (value._1, value._2, value._3, value._4, value._5, value._6, value._7, peakPower, peakRate))
+    })
+
+    // adm 1min
+    val adm1MinIfRdd = gdm1MinIfRdd.connect(configUserInfoStream).process(
+      new BroadcastProcessFunction[((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double),
+        (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long),
+        (Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float, Long, Long, Float, Float, Float, Float, Float, Float))), BroadcastConfig, (AdmIfStatus, Int)] {
+
+        override def processBroadcastElement(configValue: BroadcastConfig, context: BroadcastProcessFunction[((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double),
+          (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long),
+          (Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float, Long, Long, Float, Float, Float, Float, Float, Float))), BroadcastConfig, (AdmIfStatus, Int)]#Context, collector: Collector[(AdmIfStatus, Int)]): Unit = {
+          val configKey = configValue.getConfigKey
+          val state = context.getBroadcastState(configStateDescriptor)
+
+          state.put(configKey, configValue)
+        }
+
+        override def processElement(value: ((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double),
+          (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long),
+          (Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float, Long, Long, Float, Float, Float, Float, Float, Float))), readOnlyContext: BroadcastProcessFunction[((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double),
+          (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long),
+          (Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float, Long, Long, Float, Float, Float, Float, Float, Float))), BroadcastConfig, (AdmIfStatus, Int)]#ReadOnlyContext, collector: Collector[(AdmIfStatus, Int)]): Unit = {
+
+          var topoLinkConfig: BroadcastConfig = readOnlyContext.getBroadcastState(configStateDescriptor).get(topoLinkConfigKey)
+
+          //根据源IP和端口作为key,获取用户名和域名
+          /*while(null == topoLinkConfig) {// 等待用户配置
+            topoLinkConfig = readOnlyContext.getBroadcastState(configStateDescriptor).get(topoLinkConfigKey)
+            Thread.sleep(1000L)
+          }*/
+          var topoLink: TopoLink = null
+          var topoLinkMap: mutable.Map[String, TopoLink] = null
+          if (null != topoLinkConfig) {
+            topoLinkMap = topoLinkConfig.getConfigTopoLinkMap
+            var gdmToAdm = ifGdmToAdm(merge1MinSecond, topoLinkMap, value)
+            collector.collect(gdmToAdm)
+          }
+        }
+      }).filter(kv => {
+      kv._1.link_id != null
+    })
+
+    val linkStatusInfoDStream = adm1MinIfRdd.assignTimestampsAndWatermarks(new LinkStatusTimestampExtractor(watermarkslinkStatus))
+
+    val adm1MinIfRddReduce = linkStatusInfoDStream.map(kv => {
+      (kv._1.link_id, kv)
+    }).keyBy(_._1)
+      .timeWindow(Time.seconds(merge1MinSecond))
+      .reduce(new ReduceFunction[(String, (AdmIfStatus, Int))] {
+        override def reduce(x: (String, (AdmIfStatus, Int)), y: (String, (AdmIfStatus, Int))): ((String), (AdmIfStatus, Int)) = {
+          val result = ((x._1), (admlinkAgg(x._2, y._2)))
+          result
+        }
+      }).map(kv => kv._2._1)
+
+// TODO 1分钟聚合逻辑结束
+    adm1MinIfRddReduce.addSink(new LinkAdmToInfluxdb(influxdbSNMPDataBase, influxdbOpenUrl, influxdbUserName, influxdbPassWord, influxdbLinkRetentionPolicy))
+
+    //聚合生成ndp_adm_link_status_5min /
+    val link5MinWithWatermarks = adm1MinIfRddReduce.assignTimestampsAndWatermarks(new Link5MinStatusTimestampExtractor(watermarkslinkStatus + 100))
+
+    val link5MinStatusToInfluxdb = link5MinWithWatermarks.map(kv =>{
+      (kv.link_id, kv)
+    }).keyBy(_._1)
+      .timeWindow(Time.seconds(merge1MinSecond * 5))
+      .reduce(new ReduceFunction[(String, AdmIfStatus)] {
+        override def reduce(x:  (String, AdmIfStatus), y:  (String, AdmIfStatus)):  (String, AdmIfStatus) = {
+          //取较小的
+          var min_speed_1_to_2 = if(x._2.min_speed_1_to_2 < y._2.min_speed_1_to_2) x._2.min_speed_1_to_2 else y._2.min_speed_1_to_2
+          var min_speed_2_to_1 = if (x._2.min_speed_2_to_1 < y._2.min_speed_2_to_1) x._2.min_speed_2_to_1 else y._2.min_speed_2_to_1
+          var min_use_ratio_1_to_2 = if (x._2.min_use_ratio_1_to_2 < y._2.min_use_ratio_1_to_2) x._2.min_use_ratio_1_to_2 else y._2.min_use_ratio_1_to_2
+          var min_use_ratio_2_to_1 = if (x._2.min_use_ratio_2_to_1 < y._2.min_use_ratio_2_to_1) x._2.min_use_ratio_2_to_1 else y._2.min_use_ratio_2_to_1
+          var min_transceiver_rx_power_all_1_to_2 = if (x._2.min_transceiver_rx_power_all_1_to_2 < y._2.min_transceiver_rx_power_all_1_to_2) x._2.min_transceiver_rx_power_all_1_to_2
+          else y._2.min_transceiver_rx_power_all_1_to_2
+          var min_transceiver_rx_power_all_2_to_1 = if (x._2.min_transceiver_rx_power_all_2_to_1 < y._2.min_transceiver_rx_power_all_2_to_1) x._2.min_transceiver_rx_power_all_2_to_1
+          else y._2.min_transceiver_rx_power_all_2_to_1
+
+          //取较大的
+          var max_speed_1_to_2 =  if(x._2.max_speed_1_to_2 > y._2.max_speed_1_to_2 ) x._2.max_speed_1_to_2 else  y._2.max_speed_1_to_2
+          var max_speed_2_to_1 = if (x._2.max_speed_2_to_1 > y._2.max_speed_2_to_1) x._2.max_speed_2_to_1 else y._2.max_speed_2_to_1
+          var max_use_ratio_1_to_2 = if (x._2.max_use_ratio_1_to_2 > y._2.max_use_ratio_1_to_2) x._2.max_use_ratio_1_to_2 else y._2.max_use_ratio_1_to_2
+          var max_use_ratio_2_to_1 = if (x._2.max_use_ratio_2_to_1 > y._2.max_use_ratio_2_to_1) x._2.max_use_ratio_2_to_1 else y._2.max_use_ratio_2_to_1
+
+          var max_transceiver_rx_power_all_1_to_2 = if (x._2.max_transceiver_rx_power_all_1_to_2 > y._2.max_transceiver_rx_power_all_1_to_2) x._2.max_transceiver_rx_power_all_1_to_2
+          else y._2.max_transceiver_rx_power_all_1_to_2
+
+          var max_transceiver_rx_power_all_2_to_1 = if (x._2.max_transceiver_rx_power_all_2_to_1 > y._2.max_transceiver_rx_power_all_2_to_1) x._2.max_transceiver_rx_power_all_2_to_1
+          else y._2.max_transceiver_rx_power_all_2_to_1
+
+          var link5MinStatus = new AdmIfStatus(y._2.link_id, y._2.log_time, y._2.speed_1_to_2, y._2.speed_2_to_1, y._2.use_ratio_1_to_2, y._2.use_ratio_2_to_1, y._2.lose_ratio_1_to_2, y._2.lose_ratio_2_to_1,
+            y._2.error_ratio_1_to_2, y._2.error_ratio_2_to_1, y._2.if_high_speed, y._2.nqa_grade, y._2.if_oper_status, min_speed_1_to_2, min_speed_2_to_1, min_use_ratio_1_to_2, min_use_ratio_2_to_1, max_speed_1_to_2,
+            max_speed_2_to_1, max_use_ratio_1_to_2, max_use_ratio_2_to_1, y._2.transceiver_send_power_1_to_2, y._2.transceiver_receive_power_1_to_2, y._2.transceiver_send_power_2_to_1, y._2.transceiver_receive_power_2_to_1,
+            y._2.discards_pack_1_to_2, y._2.errors_pack_1_to_2, y._2.discards_pack_2_to_1, y._2.errors_pack_2_to_1, y._2.if_oper_status_change_cnt, max_transceiver_rx_power_all_1_to_2, max_transceiver_rx_power_all_2_to_1,
+            min_transceiver_rx_power_all_1_to_2, min_transceiver_rx_power_all_2_to_1)
+          (y._2.link_id, link5MinStatus)
+        }
+      }).map(kv => {
+        var link5MinStatus = kv._2
+      var time = new Timestamp(link5MinStatus.log_time.getTime - link5MinStatus.log_time.getTime % (5 * 60 * 1000) + 5 * 60 * 1000)   //向后5min取整
+      link5MinStatus.log_time = time
+      link5MinStatus
+    })
+
+    link5MinStatusToInfluxdb.addSink(new LinkAdm5minToInfluxdb(influxdbSNMPDataBase, influxdbOpenUrl, influxdbUserName, influxdbPassWord, influxdbLinkRetentionPolicy))
+    env.execute(appName)
+  }
+
+  // 计算链路评分
+  // (inSpeed, outSpeed, inUseRatio, outUseRatio, inLoseRatio, outLoseRatio, inErrorRatio, outErrorRatio)
+  def getNqaGrade(rate: Tuple8[Long, Long, Float, Float, Float, Float, Float, Float]): Int = {
+    var nqaGrade1: Int = 100
+    var nqaGrade2: Int = 100
+    var nqaGrade3: Int = 100
+    var nqaGrade4: Int = 100
+    var nqaGrade: Int = 100
+    // 错包
+    if (rate._8 == 0) {
+      nqaGrade1 = 100
+    } else if ((rate._8 > 0) && (rate._8 <= 1)) {
+      nqaGrade1 = 90
+    } else if ((rate._8 > 1) && (rate._8 <= 2)) {
+      nqaGrade1 = 80
+    } else if ((rate._8 > 2) && (rate._8 <= 3)) {
+      nqaGrade1 = 40
+    } else {
+      nqaGrade1 = 20
+    }
+    if (rate._7 == 0) {
+      nqaGrade2 = 100
+    } else if ((rate._7 > 0) && (rate._7 <= 1)) {
+      nqaGrade2 = 90
+    } else if ((rate._7 > 1) && (rate._7 <= 2)) {
+      nqaGrade2 = 80
+    } else if ((rate._7 > 2) && (rate._7 <= 3)) {
+      nqaGrade2 = 40
+    } else {
+      nqaGrade2 = 20
+    }
+    // 丢包
+    if (rate._6 == 0) {
+      nqaGrade3 = 100
+    } else if ((rate._6 > 0) && (rate._6 <= 1)) {
+      nqaGrade3 = 90
+    } else if ((rate._6 > 1) && (rate._6 <= 2)) {
+      nqaGrade3 = 80
+    } else if ((rate._6 > 2) && (rate._6 <= 3)) {
+      nqaGrade3 = 40
+    } else {
+      nqaGrade3 = 20
+    }
+    if (rate._5 == 0) {
+      nqaGrade4 = 100
+    } else if ((rate._5 > 0) && (rate._5 <= 1)) {
+      nqaGrade4 = 90
+    } else if ((rate._5 > 1) && (rate._5 <= 2)) {
+      nqaGrade4 = 80
+    } else if ((rate._5 > 2) && (rate._5 <= 3)) {
+      nqaGrade4 = 40
+    } else {
+      nqaGrade4 = 20
+    }
+    nqaGrade = Seq(nqaGrade1, nqaGrade2, nqaGrade3, nqaGrade4).min
+    if (((rate._3 > 55) && (rate._3 < 75)) || ((rate._4 > 55) && (rate._4 < 75))) {
+      if (nqaGrade > 45) {
+        nqaGrade = 45
+      }
+    } else if (((rate._3 >= 75) && (rate._3 < 85)) || ((rate._4 >= 75) && (rate._4 < 85))) {
+      if (nqaGrade > 25) {
+        nqaGrade = 25
+      }
+    } else if ((rate._3 >= 85) || (rate._4 >= 85)) {
+      if (nqaGrade > 15) {
+        nqaGrade = 15
+      }
+    }
+    nqaGrade
+  }
+
+  def admlinkAgg(x: (AdmIfStatus, Int), y: (AdmIfStatus, Int)): (AdmIfStatus, Int) = {
+    val operStatus = if (x._1.if_oper_status == 1 && y._1.if_oper_status == 1) 1 else 2
+    if (x._2 == y._2) { // 一般不出现
+      if (x._1.speed_1_to_2 > y._1.speed_1_to_2 || x._1.speed_2_to_1 > y._1.speed_2_to_1) {
+        x._1.if_oper_status = operStatus
+        x
+      }
+      else if (x._1.speed_1_to_2 <= y._1.speed_1_to_2 || x._1.speed_2_to_1 <= y._1.speed_2_to_1) {
+        y._1.if_oper_status = operStatus
+        y
+      }
+      else {
+        x._1.if_oper_status = operStatus
+        x
+      }
+    } else {
+      // 链路两端接口
+      var result = if (x._1.speed_1_to_2 != 0 || x._1.speed_2_to_1 != 0) x._1 else y._1
+      // a->b错包 = sum(a.out + b.in)     a->b丢包 = sum(a.out + b.in)
+      if (x._1.transceiver_send_power_1_to_2 != 2147483647L && y._1.transceiver_send_power_1_to_2 != 2147483647L) {
+        if (x._2 == 1) {
+          result.transceiver_send_power_1_to_2 = x._1.transceiver_send_power_1_to_2
+          result.transceiver_receive_power_1_to_2 = x._1.transceiver_receive_power_1_to_2
+          result.transceiver_send_power_2_to_1 = y._1.transceiver_send_power_2_to_1
+          result.transceiver_receive_power_2_to_1 = y._1.transceiver_receive_power_2_to_1
+          result.max_transceiver_rx_power_all_1_to_2 = y._1.max_transceiver_rx_power_all_1_to_2
+          result.min_transceiver_rx_power_all_1_to_2 = y._1.min_transceiver_rx_power_all_1_to_2
+        } else {
+          result.transceiver_send_power_1_to_2 = y._1.transceiver_send_power_1_to_2
+          result.transceiver_receive_power_1_to_2 = y._1.transceiver_receive_power_1_to_2
+          result.transceiver_send_power_2_to_1 = x._1.transceiver_send_power_2_to_1
+          result.transceiver_receive_power_2_to_1 = x._1.transceiver_receive_power_2_to_1
+          result.max_transceiver_rx_power_all_2_to_1 = y._1.max_transceiver_rx_power_all_2_to_1
+          result.min_transceiver_rx_power_all_2_to_1 = y._1.min_transceiver_rx_power_all_2_to_1
+        }
+      }
+      if (x._1.transceiver_send_power_1_to_2 == 2147483647L && y._1.transceiver_send_power_1_to_2 != 2147483647L) result = y._1
+      if (y._1.transceiver_send_power_1_to_2 == 2147483647L && x._1.transceiver_send_power_1_to_2 != 2147483647L) result = x._1
+      result.if_oper_status = operStatus
+      result.if_oper_status_change_cnt = max(y._1.if_oper_status_change_cnt, result.if_oper_status_change_cnt).toInt
+      result.discards_pack_1_to_2 = sum(x._1.discards_pack_1_to_2, y._1.discards_pack_1_to_2)
+      result.discards_pack_2_to_1 = sum(x._1.discards_pack_2_to_1, y._1.discards_pack_2_to_1)
+      result.errors_pack_1_to_2 = sum(x._1.errors_pack_1_to_2, y._1.errors_pack_1_to_2)
+      result.errors_pack_2_to_1 = sum(x._1.errors_pack_2_to_1, y._1.errors_pack_2_to_1)
+      (result, 1)
+    }
+  }
+
+
+  def sum(x: Long, y: Long): Long = {
+    x + y
+  }
+
+  def round(res: Float, i: Int): Float = {
+    val j = Math.pow(10, i).toLong
+    val k = j * 1.0F
+    (res * j).round / k
+  }
+
+  def diff(x: Long, y: Long): Long = {
+    if (x != y) 1L
+    else 0L
+  }
+
+  def min(x: Long, y: Long): Long = {
+    val x1 = if (x >= 0) x else 0
+    val y1 = if (y >= 0) y else 0
+    if (x1 < y1) x1 else y1
+  }
+
+  def max(x: Long, y: Long): Long = {
+    if (x > y) x else y
+  }
+
+  def ifGdmToAdm(gdmSecond: Int, topoLinkInfos: mutable.Map[String, TopoLink], kv: (Tuple2[String, Long], Tuple9[Tuple4[Long, Long, Long, Long], Tuple6[Double, Double, Double, Double, Double, Double],
+    Tuple8[Double, Double, Double, Double, Double, Double, Double, Double], Tuple6[Long, Long, Long, Long, Long, Long],
+    Tuple8[Long, Long, Float, Float, Float, Float, Float, Float],
+    Tuple14[Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double], Tuple2[Long, Long],
+    Tuple4[Long, Long, Long, Long], Tuple16[Long, Long, Float, Float, Float, Float, Float, Float, Long, Long, Float, Float, Float, Float, Float, Float]])): (AdmIfStatus, Int) = {
+    val topoLinkInfo = findTopoLink(kv._1._1, kv._1._2, topoLinkInfos)
+    var linkId: String = null
+    var direction: Int = 1
+    if (topoLinkInfo != null) {
+      linkId = topoLinkInfo.linkId
+      direction = topoLinkInfo.direction
+    }
+    val rate = kv._2._5
+    // 添加峰值
+    val peakRate = kv._2._9
+    val peakPower = kv._2._8
+    //添加评分
+    val nqaGrade = getNqaGrade(rate)
+
+    val transceiver = kv._2._4
+    val last = kv._2._6
+    val cnt = kv._2._7
+    val now = kv._2._2
+    val inDiscards = Math.abs(now._2 - last._2).toLong
+    val outDiscards = Math.abs(now._5 - last._5).toLong
+    val inErrors = Math.abs(now._3 - last._3).toLong
+    val outErrors = Math.abs(now._6 - last._6).toLong
+
+    val ifOperStatus = kv._2._1._2.toInt
+    var date: Date = new Date(kv._2._1._1)
+    if (gdmSecond >= 60) {
+      date = genTimeMin(date, gdmSecond / 60)
+    }
+    // 保留小数位数
+    val num = 2
+    if (direction == 1) {
+      (new AdmIfStatus(linkId, new Timestamp(date.getTime),
+        rate._2, rate._1, round(rate._4, num), round(rate._3, num), round(rate._6, num), round(rate._5, num),
+        round(rate._8, num), round(rate._7, num),
+        kv._2._1._4, nqaGrade, ifOperStatus,
+        peakRate._2, peakRate._1, round(peakRate._4, num), round(peakRate._3, num), peakRate._10, peakRate._9, round(peakRate._12, num), round(peakRate._11, num),
+        // a->b错包 = sum(a.out + b.in)     a->b丢包 = sum(a.out + b.in)
+        // 发送功率取两端最大值   接收功率取两端最小值   a->b发送 = max(a.out,b.in) a->b接收 = max(a.in,b.out)
+        transceiver._1, transceiver._4, transceiver._1, transceiver._4, outDiscards, outErrors, inDiscards, inErrors, cnt._1.toInt,
+        peakPower._3, peakPower._3, peakPower._4, peakPower._4), 1)
+    } else {
+      (new AdmIfStatus(linkId, new Timestamp(date.getTime),
+        rate._1, rate._2, round(rate._3, num), round(rate._4, num), round(rate._5, num), round(rate._6, num),
+        round(rate._7, num), round(rate._8, num), kv._2._1._4, nqaGrade, ifOperStatus,
+        peakRate._1, peakRate._2, round(peakRate._3, num), round(peakRate._4, num), peakRate._9, peakRate._10, round(peakRate._11, num), round(peakRate._12, num),
+        transceiver._1, transceiver._4, transceiver._1, transceiver._4, inDiscards, inErrors, outDiscards, outErrors, cnt._1.toInt,
+        peakPower._3, peakPower._3, peakPower._4, peakPower._4), 2)
+    }
+  }
+
+
+  def findTopoLink(assetId: String, ifIndex: Long, richConfi: mutable.Map[String, TopoLink]): AdmIfInfo = {
+    if (richConfi != null && StringUtils.isNotEmpty(assetId)) {
+      val key = assetId + "_" + ifIndex
+      val link = richConfi.getOrElse(key, null)
+      if (link != null) {
+        //          dir为1 表示用第1个设备匹配
+        if (assetId.equals(link.assetId1) && ifIndex.equals(link.ifIndex1)) {
+          return AdmIfInfo(link.linkId, 1)
+        }
+        //          dir为2 表示用第2个设备匹配
+        if (assetId.equals(link.assetId2) && ifIndex.equals(link.ifIndex2)) {
+          return AdmIfInfo(link.linkId, 2)
+        }
+      }
+    }
+    null
+  }
+
+
+  def exchangeForIfStatus(data: JSONObject, asserInfoList: util.List[AssetInfo]):
+  (Tuple2[String, Long],
+    Tuple4[Long, Long, Long, Long],
+    Tuple6[Double, Double, Double, Double, Double, Double],
+    Tuple8[Double, Double, Double, Double, Double, Double, Double, Double],
+    Tuple6[Long, Long, Long, Long, Long, Long]) = {
+    if (data != null) {
+        // 采集时间  "2019-05-10T17:29:52+0800" 需转化为long类型
+      val time: Long = exchangeDateTimeExt(data.getString("time"))
+      // val assetId: String = data.getString("assetId")
+      // 接口索引  48
+      val ifIndex: Long = getDefaultLongValue(data, "ifIndex", 0L)
+      // 端口UP/DOWN状态  1
+      var ifOperStatus: Long = getDefaultLongValue(data, "ifOperStatus", 0L)
+      ifOperStatus = if (ifOperStatus > 2) 2 else ifOperStatus
+      // 设备端口状态 1 todo 这些0 1 标识需要搞清楚分别是什么含义
+      val ifAdminStatus: Long = getDefaultLongValue(data, "ifAdminStatus", 0L)
+
+      // 接口带宽 1000
+      var ifHighSpeed: Long = getDefaultLongValue(data, "ifHighSpeed", 0L)
+      if (ifHighSpeed == 0L) {
+        // 防止除0错误
+        ifHighSpeed = 1L
+      }
+
+      // 从该接口上接收的字节数   407246083
+      val ifInOctets: Double = getDefaultDoubleValue(data, "ifInOctets", 0d)
+      // 由于资源紧张导致丢弃的包的数目            0
+      val ifInDiscards: Double = getDefaultDoubleValue(data, "ifInDiscards", 0d)
+      // 由于出错而导致丢弃的接收包的数目          0
+      val ifInErrors: Double = getDefaultDoubleValue(data, "ifInErrors", 0d)
+      // 从该接口上发送的字节总数      333449054
+      val ifOutOctets: Double = getDefaultDoubleValue(data, "ifOutOctets", 0d)
+      // 由于资源局限而导致丢弃的发出包的总数  0
+      val ifOutDiscards: Double = getDefaultDoubleValue(data, "ifOutDiscards", 0d)
+      //  由于出错而导致丢弃的发出包的总数目     0
+      val ifOutErrors: Double = getDefaultDoubleValue(data, "ifOutErrors", 0d)
+
+      // 端口入方向字节数    13292147971
+      var ifHcInOctets: Double = getDefaultDoubleValue(data, "ifHcInOctets", 0d)
+      if (ifHcInOctets.equals(0d)) {
+        ifHcInOctets = ifInOctets
+      }
+      // 入方向单播报文包数              110808358
+      val ifHcInUcastPkts: Double = getDefaultDoubleValue(data, "ifHCInUcastPkts", 0d)
+      // 入方向组播播报文包数            526749
+      val ifHcInMulticastPkts: Double = getDefaultDoubleValue(data, "ifHCInMulticastPkts", 0d)
+      // 入方向广播报文字包数             4
+      val ifHcInBroadcastPkts: Double = getDefaultDoubleValue(data, "ifHCInBroadcastPkts", 0d)
+      //
+      var ifHcOutOctets: Double = getDefaultDoubleValue(data, "ifHcOutOctets", 0d)
+      if (ifHcOutOctets.equals(0d)) {
+        ifHcOutOctets = ifOutOctets
+      }
+      // 端口出方向字节数             13218350942
+      val ifHcOutUcastPkts: Double = getDefaultDoubleValue(data, "ifHCOutUcastPkts", 0d)
+      // 出方向组播播报文包           2106974
+      val ifHcOutMulticastPkts: Double = getDefaultDoubleValue(data, "ifHCOutMulticastPkts", 0d)
+      // 出方向广播报文包数             103300
+      val ifHcOutBroadcastPkts: Double = getDefaultDoubleValue(data, "ifHCOutBroadcastPkts", 0d)
+
+      // setValue 可以求负数的Long
+      // 最大接收功率                 2147483647
+      val hh3cTransceiverMaxRxPower: Long = setValue(data, "hh3cTransceiverMaxRxpower", 0L)
+      // 最大发光功率                 2147483647
+      val hh3cTransceiverMaxTxPower: Long = setValue(data, "hh3cTransceiverMaxTxpower", 0L)
+      // 最小接收功率                 2147483647
+      val hh3cTransceiverMinRxPower: Long = setValue(data, "hh3cTransceiverMinRxpower", 0L)
+      // 最小发光功率                 2147483647
+      val hh3cTransceiverMinTxPower: Long = setValue(data, "hh3cTransceiverMinTxpower", 0L)
+      // 平均发送光功率               2147483647
+      val hh3cTransceiverCurTxPower: Long = setValue(data, "hh3cTransceiverCurTxpower", 2147483647L)
+      // 平均接收光功率               2147483647L
+      val hh3cTransceiverCurRxPower: Long = setValue(data, "hh3cTransceiverCurRxpower", 2147483647L)
+
+      //根据设备ip查找设备id 采集的设备IP
+      val deviceIp: String = data.getString("deviceIp")
+      var assetId: String = null
+      var flag: Boolean = true
+      if (deviceIp != null) {
+        for (assetInfo <- asserInfoList if flag) {
+          if (deviceIp.equals(assetInfo.hostIP)) {
+            assetId = assetInfo.assetId
+            flag = false
+          }
+        }
+      }
+
+      return ((assetId, ifIndex), (time, ifOperStatus, ifAdminStatus, ifHighSpeed), (ifInOctets, ifInDiscards, ifInErrors, ifOutOctets, ifOutDiscards, ifOutErrors),
+        (ifHcInOctets, ifHcInUcastPkts, ifHcInMulticastPkts, ifHcInBroadcastPkts, ifHcOutOctets, ifHcOutUcastPkts, ifHcOutMulticastPkts, ifHcOutBroadcastPkts),
+        (hh3cTransceiverCurTxPower, hh3cTransceiverMaxTxPower, hh3cTransceiverMinTxPower, hh3cTransceiverCurRxPower, hh3cTransceiverMaxRxPower, hh3cTransceiverMinRxPower))
+    }
+    ((null, 0L), (0L, 0L, 0L, 0L), (0d, 0d, 0d, 0d, 0d, 0d), (0d, 0d, 0d, 0d, 0d, 0d, 0d, 0d), (0L, 0L, 0L, 0L, 0L, 0L))
+  }
+
+  //参数asserInfoList存放了设备的id和ip,
+  def exchangeForNodeStatus(data: JSONObject, asserInfoList: util.List[AssetInfo]): (Tuple6[String, Long, Long, String, String, Long], Tuple18[Long, Long, Long, Map[String, String], Long, Map[String, String], Long, util.HashMap[String, String], Long, Long, Long, Map[String, String], Map[String, String], Map[String, String], Map[String, String], Map[String, String], Map[String, String], Map[String, String]]) = {
+    val time: Long = exchangeDateTimeExt(data.getString("time"))
+    //val assetId: String = data.getString("assetId")
+    val hh3cEntityExtPhysicalIndex = getDefaultLongValue(data, "hh3cEntityExtPhysicalIndex", 0L)
+    val entPhysicalClass = getDefaultLongValue(data, "entPhysicalClass", 0L)
+    val entPhysicalName = getDefaultString(data, "entPhysicalName", "")
+    val entPhysicalDescr = getDefaultString(data, "entPhysicalDescr", "")
+    val board = getDefaultLongValue(data, "board", 0L)
+    val hh3cEntityExtAdminStatus = getDefaultLongValue(data, "hh3cEntityExtAdminStatus", 0L)
+    val hh3cEntityExtOperStatus = getDefaultLongValue(data, "hh3cEntityExtOperStatus", 0L)
+    val hh3cEntityExtCpuUsageThreshold = getDefaultLongValue(data, "hh3cEntityExtCpuUsageThreshold", 0L)
+    val hh3cEntityExtMemUsageThreshold = getDefaultLongValue(data, "hh3cEntityExtMemUsageThreshold", 0L)
+    val hh3cEntityExtTemperatureThreshold = getDefaultLongValue(data, "hh3cEntityExtTemperatureThreshold", 0L)
+    val hh3cEntityExtErrorStatus = getDefaultLongValue(data, "hh3cEntityExtErrorStatus", 0L)
+    val hh3cEntityExtCpuMaxUsage = getDefaultLongValue(data, "hh3cEntityExtCpuMaxUsage", 0L)
+
+    //根据设备ip查找设备id
+    val deviceIp: String = data.getString("deviceIp")
+    var assetId: String = null
+    var flag: Boolean = true
+    if (deviceIp != null) {
+      for (assetInfo <- asserInfoList if flag) {
+        if (deviceIp.equals(assetInfo.hostIP)) {
+          assetId = assetInfo.assetId
+          flag = false
+        }
+      }
+    }
+
+    val cpuRatio: Map[String, String] = json2Map(data, "cpuUsage")
+    val memRatio: Map[String, String] = json2Map(data, "memUsage")
+    val fan: Map[String, String] = json2Map(data, "fan")
+    val temperatureVal: Map[String, String] = json2Map(data, "temperature")
+    val power: Map[String, String] = json2Map(data, "power")
+    val boardStatus: Map[String, String] = json2Map(data, "boardStatus")
+    val sysMemRatio: Map[String, String] = json2Map(data, "sysMemRatio")
+    val sysCpuRatio: Map[String, String] = json2Map(data, "sysCpuRatio")
+    val currentPower: Map[String, String] = json2Map(data, "power_current")
+    val powerType: Map[String, String] = json2Map(data, "power_type")
+
+    //遍历temperature的key，截取掉key的后两位(之前在采集那边截取掉的，现在换到解析这边截取掉)
+    var temperature: util.HashMap[String, String] = new util.HashMap[String, String]()
+    for (temperatureKey <- temperatureVal.keys) {
+      var value: String = temperatureVal.getOrElse[String](temperatureKey, "0")
+      var key: String = temperatureKey.substring(0, temperatureKey.size - 2)
+      temperature.put(key, value)
+    }
+
+    ((assetId, hh3cEntityExtPhysicalIndex, entPhysicalClass, entPhysicalName, entPhysicalDescr, board),
+      (time, hh3cEntityExtAdminStatus, hh3cEntityExtOperStatus, cpuRatio, hh3cEntityExtCpuUsageThreshold, memRatio, hh3cEntityExtMemUsageThreshold,
+        temperature, hh3cEntityExtTemperatureThreshold, hh3cEntityExtErrorStatus, hh3cEntityExtCpuMaxUsage, fan, power, boardStatus, sysMemRatio, sysCpuRatio, currentPower, powerType))
+  }
+
+  // PSE
+  def exchangeForPSE(data: JSONObject, asserInfoList: util.List[AssetInfo]): (String, Long, Map[String, String], Map[String, String], Map[String, String], Map[String, String]) = {
+    val time: Long = exchangeDateTimeExt(data.getString("time"))
+
+    //根据设备ip查找设备id
+    val deviceIp: String = data.getString("deviceIp")
+    var assetId: String = null
+    var flag: Boolean = true
+    if (deviceIp != null) {
+      for (assetInfo <- asserInfoList if flag) {
+        if (deviceIp.equals(assetInfo.hostIP)) {
+          assetId = assetInfo.assetId
+          flag = false
+        }
+      }
+    }
+
+    val powerLimit: Map[String, String] = json2Map(data, "power_limit")
+    val powerAverage: Map[String, String] = json2Map(data, "power_average")
+    val powerPeak: Map[String, String] = json2Map(data, "power_peak")
+    val powerRemainGuara: Map[String, String] = json2Map(data, "power_remain_guara")
+
+    (assetId, time, powerLimit, powerAverage, powerPeak, powerRemainGuara)
+  }
+
+  // POE 接口
+  def exchangeForPoeIf(data: JSONObject, asserInfoList: util.List[AssetInfo]): (String, Long, Map[String, String], Map[String, String], Map[String, String], Map[String, String], Map[String, String], Map[String, String], Map[String, String], Map[String, String]) = {
+    val time: Long = exchangeDateTimeExt(data.getString("time"))
+
+    //根据设备ip查找设备id
+    val deviceIp: String = data.getString("deviceIp")
+    var assetId: String = null
+    var flag: Boolean = true
+    if (deviceIp != null) {
+      for (assetInfo <- asserInfoList if flag) {
+        if (deviceIp.equals(assetInfo.hostIP)) {
+          assetId = assetInfo.assetId
+          flag = false
+        }
+      }
+    }
+
+    val pseId: Map[String, String] = json2Map(data, "pse_id")
+    val adminEnable: Map[String, String] = json2Map(data, "admin_enable")
+    val detectionStatus: Map[String, String] = json2Map(data, "detection_status")
+    val priority: Map[String, String] = json2Map(data, "priority")
+    val powerLimit: Map[String, String] = json2Map(data, "power_limit_if")
+    val powerAverage: Map[String, String] = json2Map(data, "power_average_if")
+    val powerPeak: Map[String, String] = json2Map(data, "power_peak_if")
+    val powerCurrent: Map[String, String] = json2Map(data, "power_current_if")
+
+    (assetId, time, pseId, adminEnable, detectionStatus, priority, powerPeak, powerAverage, powerCurrent, powerLimit)
+  }
+
+  def exchangeDateTimeExt(date: String): Long = {
+    val timeFormat2 = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'+0800'")
+    val timeFormat1 = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+    var dateValue: Long = Long.MaxValue
+    try {
+      val date1 = timeFormat2.parse(date)
+      dateValue = date1.getTime.toLong
+    } catch {
+      case t: Throwable => {
+        try {
+          val date2 = timeFormat1.parse(date)
+          dateValue = date2.getTime.toLong
+        } catch {
+          case t: Throwable => {
+            LogUtil.diagLog(Severity.ERROR, "exchangeDateTimeExt error! {}", ExceptionUtils.getStackTrace(t))
+            dateValue = Long.MaxValue
+          }
+        }
+      }
+    }
+    dateValue
+  }
+
+  def getDefaultLongValue(data: JSONObject, key: String, default: Long): Long = {
+    val value: Long = if (!data.has(key) || null == data.get(key)) {
+      default
+    } else {
+      if (data.getString(key).toLong >= 0) data.getString(key).toLong else 0L
+    }
+    value
+  }
+
+  def getDefaultString(jsonObject: JSONObject, key: String, defaultValue: String): String = {
+    if (jsonObject.has(key)) jsonObject.getString(key) else defaultValue
+  }
+
+  def getDefaultDoubleValue(data: JSONObject, key: String, default: Double): Double = {
+    val value: Double = if (!data.has(key) || null == data.get(key)) {
+      default
+    } else {
+      data.getDouble(key)
+    }
+    value
+  }
+
+  def setValue(data: JSONObject, key: String, default: Long): Long = {
+    val value: Long = if (!data.has(key) || null == data.get(key) || "noSuchObject".equals(data.getString(key)) || "noSuchInstance".equals(data.getString(key))) {
+      default
+    } else {
+      data.getString(key).toLong
+    }
+    value
+  }
+
+  def getLinkHighSpeed(topoInfos: mutable.Map[String, TopoLink], highSpeeds: util.List[BandWidthSet], assetId: String, ifIndex: Long, default: Long): Long = {
+    if (highSpeeds != null && topoInfos != null) {
+      var i: Int = 0
+      var assetName: String = ""
+      topoInfos.foreach(kv => {
+        val link = kv._2
+        if (link.assetId1.equals(assetId))
+          assetName = link.assetName1
+        else if (link.assetId2.equals(assetId))
+          assetName = link.assetName2
+      })
+      while (i < highSpeeds.size) {
+        val bandWidthSet: BandWidthSet = highSpeeds.get(i)
+        if (assetName.equals(bandWidthSet.assetname1) && ifIndex == bandWidthSet.ifindex1) {
+          return bandWidthSet.setifhighspeed
+        }
+        if (assetName.equals(bandWidthSet.assetname2) && ifIndex == bandWidthSet.ifindex1) {
+          return bandWidthSet.setifhighspeed
+        }
+        i += 1
+      }
+    }
+    default
+  }
+
+  def exchangeForNodeIp(data: JSONObject, asserInfoList: util.List[AssetInfo]): Tuple5[Long, String, Map[String, String], Map[String, String], Map[String, String]] = {
+
+    val time: Long = exchangeDateTimeExt(data.getString("time"))
+
+    //根据设备ip查找设备id
+    val deviceIp: String = data.getString("deviceIp")
+    var assetId: String = null
+    var flag: Boolean = true
+    if (deviceIp != null) {
+      for (assetInfo <- asserInfoList if flag) {
+        if (deviceIp.equals(assetInfo.hostIP)) {
+          assetId = assetInfo.assetId
+          flag = false
+        }
+      }
+    }
+
+    val nodeIp: Map[String, String] = json2Map(data, "nodeIp")
+
+    val nodeIndex: Map[String, String] = json2Map(data, "nodeIndex")
+
+    val nodeNetMask: Map[String, String] = json2Map(data, "nodeNetMask")
+
+    //循环获取设备ip对应的index
+    /* val ipKeys = nodeIp.keys
+     val indexKeys = nodeIndex.keys
+     try{
+       for(key <- ipKeys){
+         if(indexKeys.contains(key)){
+           try{
+             var index : Long = nodeIndex.get(key).toString.toLong
+             var inInfo = (time, assetId, index, key)
+             resultList.add(inInfo)
+
+           }catch{
+             case ex: Exception =>
+               logError("!!! 解析设备ip对应的index为Long时出现 error !!!")
+               logError(ex.getMessage)
+           }
+         }
+       }
+
+     }catch {
+       case ex: Exception =>
+         logError("!!! 分解设备ip和index时出现 error !!!")
+         logError(ex.getMessage)
+     }*/
+
+    (time, assetId, nodeIp, nodeIndex, nodeNetMask)
+
+  }
+
+  /**
+    *
+    * 元组数据：设备IP,时间,目的IP,探测类型,丢包率,响应时间,URL地址
+    */
+  def exchangeForSnmpNqa(data: JSONObject): (Tuple7[String, Long, Map[String, String], Map[String, String],
+    Map[String, String], Map[String, String], Map[String, String]]) = {
+    val deviceIp: String = data.getString("deviceIp")
+    val time: Long = exchangeDateTimeExt(data.getString("time"))
+
+    def json2StringMap(src: JSONObject, key: String): Map[String, String] = {
+      val value = json.JSON.parseFull(src.getString(key))
+      value match {
+        case Some(map: Any) => map.asInstanceOf[Map[String, String]]
+        case None => Map[String, String]()
+      }
+    }
+
+    val destAddress: Map[String, String] = json2StringMap(data, "destIp")
+    val protocolType: Map[String, String] = json2StringMap(data, "testType")
+    val losePacket: Map[String, String] = json2StringMap(data, "losePacket")
+    val rtt: Map[String, String] = json2StringMap(data, "RTT")
+    val httpPage: Map[String, String] = json2StringMap(data, "httpPage")
+
+    (deviceIp, time, destAddress, protocolType, losePacket, rtt, httpPage)
+  }
+
+  def getOptionValue(x: Option[String]) = x match {
+    case Some(s) => s
+  }
+
+  // json转化为map
+  def json2Map(src: JSONObject, key: String): Map[String, String] = {
+    if (src.get(key)!=null) {
+      val value = json.JSON.parseFull(src.getString(key))
+      value match {
+        case Some(map: Any) => map.asInstanceOf[Map[String, String]]
+        case None => Map[String, String]()
+      }
+    } else {
+      Map[String, String]()
+    }
+  }
+}
+
+case class AdmCollect(log_time: Timestamp, asset_id: String, if_index: Int, in_octets: Long, out_octets: Long, in_use_ratio: Float, out_use_ratio: Float, in_speed: Long, out_speed: Long, if_high_speed: Long)
+
+case class AdmIfInfo(linkId: String, direction: Integer)
+
+
+/*
+class linkTimestampExtractor extends AssignerWithPeriodicWatermarks[((String, Long), (Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long, Long, Long, Long, Long))] with Serializable {
+  override def extractTimestamp(e: ((String, Long), (Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long, Long, Long, Long, Long)), prevElementTimestamp: Long) = {
+    e._2._1
+  }
+  override def getCurrentWatermark(): Watermark = {
+    new Watermark(System.currentTimeMillis)
+  }
+  def exchangeDateTimeExt(date: String): Long = {
+    val timeFormat2 = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'+0800'")
+    val timeFormat1 = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+    var dateValue: Long = Long.MaxValue
+    try {
+      val date1 = timeFormat2.parse(date)
+      dateValue = date1.getTime.toLong
+    } catch {
+      case t: Throwable => {
+        try {
+          val date2 = timeFormat1.parse(date)
+          dateValue = date2.getTime.toLong
+        } catch {
+          case t: Throwable => {
+            t.printStackTrace()
+            dateValue = Long.MaxValue
+          }
+        }
+      }
+    }
+    dateValue
+  }
+
+}
+*/
+
+class FanTimestampExtractor(var delay: Int) extends AssignerWithPeriodicWatermarks[(Tuple2[String, Long], Tuple2[Long, Long])] {
+  override def extractTimestamp(element: (Tuple2[String, Long], Tuple2[Long, Long]), previousElementTimestamp: Long): Long = {
+    element._2._1
+  }
+
+  override def getCurrentWatermark: Watermark = {
+    new Watermark(System.currentTimeMillis() - delay)
+  }
+}
+
+class Fan5MinTimestampExtractor(var delay: Int) extends AssignerWithPeriodicWatermarks[(Tuple2[String, Long], Tuple3[Long, Long, Long])] {
+  override def extractTimestamp(element: (Tuple2[String, Long], Tuple3[Long, Long, Long]), previousElementTimestamp: Long): Long = {
+    element._2._1
+  }
+
+  override def getCurrentWatermark: Watermark = {
+    new Watermark(System.currentTimeMillis() - delay)
+  }
+}
+
+
+class PowerTimestampExtractor(var delay: Int) extends AssignerWithPeriodicWatermarks[(Tuple2[String, Long], Tuple4[Long, Long, Long, Long])] {
+  override def extractTimestamp(element: (Tuple2[String, Long], Tuple4[Long, Long, Long, Long]), previousElementTimestamp: Long): Long = {
+    element._2._1
+  }
+
+  override def getCurrentWatermark: Watermark = {
+    new Watermark(System.currentTimeMillis() - delay)
+  }
+}
+
+class Power5MinTimestampExtractor(var delay: Int) extends AssignerWithPeriodicWatermarks[(Tuple2[String, Long], Tuple5[Long, Long, Long, Long, Long])] {
+  override def extractTimestamp(element: (Tuple2[String, Long], Tuple5[Long, Long, Long, Long, Long]), previousElementTimestamp: Long): Long = {
+    element._2._1
+  }
+
+  override def getCurrentWatermark: Watermark = {
+    new Watermark(System.currentTimeMillis() - delay)
+  }
+}
+
+
+class NodeTimestampExtractor(var delay: Int) extends AssignerWithPeriodicWatermarks[(Tuple8[String, Long, Long, String, String, Long, Long, Long], Tuple11[Long, Long, Long, Long, Long, Long, Long, Long, Long, Long, Long])] {
+  override def extractTimestamp(element: (Tuple8[String, Long, Long, String, String, Long, Long, Long], Tuple11[Long, Long, Long, Long, Long, Long, Long, Long, Long, Long, Long]),
+                                previousElementTimestamp: Long): Long = {
+    element._2._1
+  }
+
+  override def getCurrentWatermark: Watermark = {
+    new Watermark(System.currentTimeMillis() - delay)
+  }
+}
+
+class LinkTimestampExtractor(var delay: Int) extends AssignerWithPeriodicWatermarks[((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long)))] {
+  override def extractTimestamp(element: ((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double), (Long, Long))), previousElementTimestamp: Long): Long = {
+    element._2._1._1
+  }
+
+  override def getCurrentWatermark: Watermark = {
+    new Watermark(System.currentTimeMillis() - delay)
+  }
+}
+
+class LinkStatusTimestampExtractor(var delay: Int) extends AssignerWithPeriodicWatermarks[(AdmIfStatus, Int)] {
+  override def extractTimestamp(element: (AdmIfStatus, Int), previousElementTimestamp: Long): Long = {
+    element._1.log_time.getTime
+  }
+
+  override def getCurrentWatermark: Watermark = {
+    new Watermark(System.currentTimeMillis() - delay)
+  }
+}
+
+class Link5MinStatusTimestampExtractor(var delay: Int) extends AssignerWithPeriodicWatermarks[AdmIfStatus] {
+  override def extractTimestamp(element: AdmIfStatus, previousElementTimestamp: Long): Long = {
+    element.log_time.getTime
+  }
+
+  override def getCurrentWatermark: Watermark = {
+    new Watermark(System.currentTimeMillis() - delay)
+  }
+}
+
+
+
+
+class CollectTimestampExtractor(var delay: Int) extends AssignerWithPeriodicWatermarks[((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double),
+  (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double),
+  (Long, Long), (Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float, Long, Long, Float, Float, Float, Float, Float, Float)))] {
+  override def extractTimestamp(element: ((String, Long), ((Long, Long, Long, Long), (Double, Double, Double, Double, Double, Double), (Double, Double, Double, Double, Double, Double, Double, Double),
+    (Long, Long, Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float), (Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double, Double),
+    (Long, Long), (Long, Long, Long, Long), (Long, Long, Float, Float, Float, Float, Float, Float, Long, Long, Float, Float, Float, Float, Float, Float))), previousElementTimestamp: Long): Long = {
+    element._2._1._1
+  }
+
+  override def getCurrentWatermark: Watermark = {
+    new Watermark(System.currentTimeMillis() - delay)
+  }
+}
+
+class NodeStatusTimestampExtractor(var delay: Int) extends AssignerWithPeriodicWatermarks[((Date, String),(Long, Long, Long, Long, Long, Long))] {
+  override def extractTimestamp(element: ((Date, String), (Long, Long, Long, Long, Long, Long)), previousElementTimestamp: Long): Long = {
+    element._2._1
+  }
+
+  override def getCurrentWatermark: Watermark = {
+
+    new Watermark(System.currentTimeMillis() - delay)
+  }
+}
+
+class NodeStatus5TimestampExtractor(var delay: Int) extends AssignerWithPeriodicWatermarks[((String, String,String, String),(String, String,String, String, String, String,String, String,
+  String, String,String, String, String, String,String, String, String, String,String, String), (String, String,String, String, String))] {
+  override def extractTimestamp(element: ((String, String,String, String),(String, String,String, String, String, String,String, String,
+    String, String,String, String, String, String,String, String, String, String,String, String), (String, String,String, String, String)), previousElementTimestamp: Long): Long = {
+    val sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+    sdf.parse(element._2._1).getTime
+  }
+
+  override def getCurrentWatermark: Watermark = {
+
+    new Watermark(System.currentTimeMillis() - delay)
+  }
+}
+
+
+class NodeStatisticsTimestampExtractor(var delay: Int) extends AssignerWithPeriodicWatermarks[(Date, String, Long, Long, Long, Long, Long, Long)] {
+  override def extractTimestamp(element: (Date, String, Long, Long, Long, Long, Long, Long), previousElementTimestamp: Long): Long = {
+    element._3
+  }
+
+  override def getCurrentWatermark: Watermark = {
+
+    new Watermark(System.currentTimeMillis() - delay)
+  }
+}
+
+class PseStatisticsTimestampExtractor(var delay: Int) extends AssignerWithPeriodicWatermarks[((String, String), (Long, Long, Long, Long, Long, Int))] {
+  override def extractTimestamp(element: ((String, String), (Long, Long, Long, Long, Long, Int)), previousElementTimestamp: Long): Long = {
+    element._2._1
+  }
+
+  override def getCurrentWatermark: Watermark = {
+
+    new Watermark(System.currentTimeMillis() - delay)
+  }
+}
+
+class PoeIfStatisticsTimestampExtractor(var delay: Int) extends AssignerWithPeriodicWatermarks[((String, String), (Long, Long, Long, Long, Long, Long, Long, Long, Long, Int))] {
+  override def extractTimestamp(element: ((String, String), (Long, Long, Long, Long, Long, Long, Long, Long, Long, Int)), previousElementTimestamp: Long): Long = {
+    element._2._1
+  }
+
+  override def getCurrentWatermark: Watermark = {
+
+    new Watermark(System.currentTimeMillis() - delay)
+  }
+}
+
+object FlinkSnmpTest {
+
+  private val app = new FlinkSnmpTest("FlinkSnmpTest")
+
+  /**
+    * 样例数据（分隔符为.）：
+    * 日志时间.日志类型.源IP.目标IP.源端口.目标端口.应用名称.上行字节.下行字节.网络延迟.应用延迟.创建时间.开始时间.结束时间.连接类型.协议编码.连接状态
+    * 2018-12-26 10:50:22.123.traffic_session.10.1.8.160.101.8.195.10.6627.8671.快车.68.67.100.345.1503586846460.1503586846460.1503586856470.1.17.0
+    */
+  def main(args: Array[String]): Unit = {
+//    val path = "D:\\projects\\itoa-net-state-monitoring\\external\\FlinkSnmp\\src\\main\\resources\\itoa-base-test.properties"
+//    val s= Array(path)
+//    app.run(s)
+
+//    app.run(s)
+    app.run(args)
+  }
+
+}
