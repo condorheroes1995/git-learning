@@ -1,0 +1,256 @@
+#include <stdint.h>
+#include <inttypes.h>
+#include <rte_eal.h>
+#include <rte_ethdev.h>
+#include <rte_cycles.h>
+#include <rte_lcore.h>
+#include <rte_mbuf.h>
+#include <rte_ip.h>
+#include <string.h>
+
+#define RX_RING_SIZE 128
+#define TX_RING_SIZE 512
+#define BURST_SIZE 32
+#define ERROR -1
+#define SUCCESS 1
+#define NUM_MBUFS 8191
+#define MBUF_CACHE_SIZE 250
+
+struct rte_mempool *pktmbuf_pool = NULL;
+
+int num_ports;
+
+const char *program_name;
+const char *memory_channels;
+const char *memory;
+const char *program_id;
+
+static const struct rte_eth_conf port_conf_default = {
+	.rxmode = { .max_rx_pkt_len = ETHER_MAX_LEN }
+};
+
+static inline int
+port_init(uint16_t port, struct rte_mempool *mbuf_pool)
+{
+	struct rte_eth_conf port_conf = port_conf_default;
+	const uint16_t rx_rings = 1, tx_rings = 1;
+	uint16_t nb_rxd = RX_RING_SIZE;
+	uint16_t nb_txd = TX_RING_SIZE;
+	int retval;
+	uint16_t q;
+
+	if (port >= rte_eth_dev_count())
+		return -1;
+
+	/* Configure the Ethernet device. */
+	retval = rte_eth_dev_configure(port, rx_rings, tx_rings, &port_conf);
+	if (retval != 0)
+		return retval;
+
+	retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
+	if (retval != 0)
+		return retval;
+
+	/* Allocate and set up 1 RX queue per Ethernet port. */
+	for (q = 0; q < rx_rings; q++) {
+		retval = rte_eth_rx_queue_setup(port, q, nb_rxd,
+				rte_eth_dev_socket_id(port), NULL, mbuf_pool);
+		if (retval < 0)
+			return retval;
+	}
+
+	/* Allocate and set up 1 TX queue per Ethernet port. */
+	for (q = 0; q < tx_rings; q++) {
+		retval = rte_eth_tx_queue_setup(port, q, nb_txd,
+				rte_eth_dev_socket_id(port), NULL);
+		if (retval < 0)
+			return retval;
+	}
+
+	/* Start the Ethernet port. */
+	retval = rte_eth_dev_start(port);
+	if (retval < 0)
+		return retval;
+
+	/* Display the port MAC address. */
+	struct ether_addr addr;
+	rte_eth_macaddr_get(port, &addr);
+	printf("Port %u MAC: %02" PRIx8 " %02" PRIx8 " %02" PRIx8
+			   " %02" PRIx8 " %02" PRIx8 " %02" PRIx8 "\n",
+			port,
+			addr.addr_bytes[0], addr.addr_bytes[1],
+			addr.addr_bytes[2], addr.addr_bytes[3],
+			addr.addr_bytes[4], addr.addr_bytes[5]);
+
+	/* Enable RX in promiscuous mode for the Ethernet device. */
+	rte_eth_promiscuous_enable(port);
+
+	return 0;
+}
+
+/*
+  初始化环境,已经编译通过
+  */
+int nat_init_eal() {
+	int argc = 1 + // program name
+			   2 + // core mask and flag
+			  // 2 + // memory channels and flag
+			  // 2 + // file prefix and flag
+			   2 ;// memory and flag
+//			   (2*blacklist_count); // flag and port for each blacklisted port
+
+	//malloc is ok at start of program
+
+	char **argv = malloc(argc * sizeof(char*));
+	int i;
+	for (i = 0; i < argc; i++) {
+		//overkill but works
+		argv[i] = malloc(120 * sizeof(char));
+	}
+
+	strcpy(argv[0], "./build/basicfwd");
+	strcpy(argv[1], "-l\0");
+	strcpy(argv[2], "1\0");
+	strcpy(argv[3], "-n\0");
+	strcpy(argv[4], "4\0");
+	//strcpy(argv[5], "--file-prefix\0");
+	//strcpy(argv[6], program_id);
+	//strcpy(argv[7], "-m\0");
+	//strcpy(argv[8], memory);
+
+//	for (i = 0; i < blacklist_count; i++) {
+//		strcpy(argv[9+(i*2)], "-b");
+//		strcpy(argv[9+((i*2)+1)], blacklist[i]);
+//	}
+
+	// can't free args since they are a constant and used throughout - at least in setup;
+
+	int ret = rte_eal_init(argc, argv);
+	if (ret < 0) {
+		return ERROR;
+	} else {
+		return SUCCESS;
+	}
+}
+
+/*
+ 检查绑定网卡的个数
+*/
+
+int nat_check_ports() {
+
+	num_ports = rte_eth_dev_count();
+	if (num_ports == 0) {
+		return ERROR;
+	}
+	return num_ports;
+}
+
+/*
+创建内存池
+*/
+int nat_create_mempool() {
+	
+	/* Creates a new mempool in memory to hold the mbufs. */
+	pktmbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS * num_ports,
+		MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+	if (pktmbuf_pool == NULL) {
+		return ERROR;
+	}
+	return SUCCESS;
+}
+
+/*
+ 初始化网卡
+ */
+void nat_port_init(){
+	uint16_t portid;
+	for (portid = 0; portid < num_ports; portid++)
+		if (port_init(portid, pktmbuf_pool) != 0)
+			rte_exit(EXIT_FAILURE, "Cannot init port %"PRIu16 "\n",
+					portid);
+}
+
+/*
+接收报文并简单打印
+*/
+void nat_receive_burst(int nb_ports) {
+	struct rte_mbuf *pkts_burst[512];
+    uint16_t port;
+		for (;;) {
+		/*
+		 * Receive packets on a port and forward them on the paired
+		 * port. The mapping is 0 -> 1, 1 -> 0, 2 -> 3, 3 -> 2, etc.
+		 */
+		for (port = 0; port < nb_ports; port++) {
+
+			/* Get burst of RX packets, from first port of pair. */
+			struct rte_mbuf *bufs[BURST_SIZE];
+			const uint16_t nb_rx = rte_eth_rx_burst(port, 0,
+					bufs, BURST_SIZE);
+			uint16_t packet_count = (uint16_t)nb_rx;
+                        int packet_num;
+					if (nb_rx != 0)
+					{
+						/* code */
+						printf("包的个数为=========== %d\n" ,nb_rx);
+						for (packet_num = 0; packet_num < packet_count; packet_num++) {
+			                struct ipv4_hdr* hdr = (struct ipv4_hdr *)(rte_pktmbuf_mtod(bufs[packet_num], unsigned char *) + sizeof(struct ether_hdr));
+	                        printf("C: Packet %d version_ihl = %" PRIu8 " : %p\n", packet_num, hdr->version_ihl, &hdr->version_ihl);
+	                        printf("C: Packet %d type_of_service = %" PRIu8 " : %p\n", packet_num, hdr->type_of_service, &hdr->type_of_service);
+	                        printf("C: Packet %d total_length = %" PRIu16 " : %p\n", packet_num, hdr->total_length, &hdr->total_length);
+	                        printf("C: Packet %d packet_id = %" PRIu16 " : %p\n", packet_num, hdr->packet_id, &hdr->packet_id);
+	                        printf("C: Packet %d fragment_offset = %" PRIu16 " : %p\n", packet_num, hdr->fragment_offset, &hdr->fragment_offset);
+	                        printf("C: Packet %d time_to_live = %" PRIu8 " : %p\n", packet_num, hdr->time_to_live, &hdr->time_to_live);
+	                        printf("C: Packet %d next_proto_id = %" PRIu8 " : %p\n", packet_num, hdr->next_proto_id, &hdr->next_proto_id);
+	                        printf("C: Packet %d hdr_checksum = %" PRIu16 " : %p\n", packet_num, hdr->hdr_checksum, &hdr->hdr_checksum);
+	                        printf("C: Packet %d src_addr = %" PRIu32 " : %p\n", packet_num, hdr->src_addr, &hdr->src_addr);
+	                        printf("C: Packet %d dst_addr = %" PRIu32 " : %p\n", packet_num, hdr->dst_addr, &hdr->dst_addr);
+		                 }
+					}
+
+			if (unlikely(nb_rx == 0))
+				continue;
+		}
+	}
+
+}
+
+
+int
+main(int argc, char *argv[])
+{
+	int index;
+	for(index = 0; index < argc; index++) {
+            /* argv本身代表`char *argv[]`的第一个元素的地址，地址进行递增可以遍历数组，然后通过`*`来获取改地址对应的元素内容（这里元素的内容也是个地址）*/
+            printf("%s\n", *(argv+index));
+        }
+        int argc1 =5;
+        char **argv1 = malloc(argc1 * sizeof(char*));
+        int j;
+	for (j = 0; j < argc1; j++) {
+		//overkill but works
+		argv1[j] = malloc(120 * sizeof(char));
+          }
+        strcpy(argv1[0], "./build/basicfwd");
+	strcpy(argv1[1], "-l\0");
+	strcpy(argv1[2], "1\0");
+	strcpy(argv1[3], "-n\0");
+	strcpy(argv1[4], "4\0");
+	//int result = nat_init_eal();
+	for(index = 0; index < argc; index++) {
+            /* argv本身代表`char *argv[]`的第一个元素的地址，地址进行递增可以遍历数组，然后通过`*`来获取改地址对应的元素内容（这里元素的内容也是个地址）*/
+            printf("=====%s\n", *(argv1+index));
+        }
+     // int result = rte_eal_init(argc, argv);
+        int result = nat_init_eal();
+	printf("初始化环境结果为=========== %d\n",result);
+	int num_ports = nat_check_ports();
+	printf("绑定的网卡数=========== %d\n",num_ports);
+	int pool = nat_create_mempool();
+	printf("初始化内存池=========== %d\n",pool);
+	nat_port_init();
+	nat_receive_burst(num_ports);
+
+	return 0;
+}
